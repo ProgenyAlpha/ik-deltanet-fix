@@ -109,7 +109,19 @@ if (use_fused_delta_net && n_tok > 1) {
 }
 ```
 
-This sidesteps the CONT threading bug for generation and the chunked PPL degradation for prefill. Expected performance: ~110+ t/s PP (fused) + ~7-11 t/s TG (autoregressive) with correct output.
+### v15 Hybrid Test Results (PARTIAL FIX)
+
+Built and tested as `ik-pr1251-v15-hybrid`. Results with `-t 12`:
+
+| Prompt | v15 hybrid (fused PP + auto TG) | --no-fused-delta (chunked PP + auto TG) |
+|--------|--------------------------------|----------------------------------------|
+| Capital of France | Coherent (pedantic but correct) | Coherent, correct |
+| 7 × 8 | Coherent (wrong math, model quality) | Coherent |
+| CPU cache explanation | Correct first ~100 tokens, then degenerates into repetition/HTML hallucination | Coherent full 289-token response |
+
+**Verdict:** Hybrid dispatch eliminates the garbage output (huge improvement over immediate corruption), but the fused kernel's prefill state is not fully compatible with the autoregressive generation path. The two paths compute DeltaNet state differently, causing gradual degradation during generation as accumulated state mismatch grows.
+
+**Recommended path:** Use `--no-fused-delta` (chunked + autoregressive) for correct output, or adopt mainline implementation as ikawrakow suggested. The fused kernel needs its own T=1 threading fix rather than routing T=1 to autoregressive.
 
 ## Required Patches (Working Non-Fused Build)
 
@@ -162,18 +174,19 @@ sed -i 's|ggml_permute(ctx0, g, 2, 0, 3, 1)|ggml_permute(ctx0, g, 1, 0, 2, 3)|' 
 | `ik-pr1251-v12-deep` | Deep debug instrumentation | Proved kernel math correct |
 | `ik-pr1251-v13-ntasks1` | n_tasks=1 attempt | Failed (nth still 12 in kernel) |
 | `ik-pr1251-v14` | Single-thread kernel patch | Proved race is outside kernel |
+| `ik-pr1251-v15-hybrid` | Hybrid dispatch (fused PP + auto TG) | Partial fix — no garbage but degrades after ~100 tokens |
 
 ## Next Steps
 
-### Priority 1: Test hybrid dispatch fix
-- Patch the dispatch to use fused for T>1, autoregressive for T=1
-- Verify correct output AND correct PPL with multi-threading
-- This is likely a one-session task
-
-### Priority 2: Root-cause the CONT threading bug (T=1)
+### Priority 1: Root-cause the CONT threading bug (T=1)
 - Read `ggml_compute_forward_dup_f32` — find the f32-from-permuted code path
 - Determine why T=1 tensor shapes trigger the race but T>1 doesn't
 - Test with `-t 2` to find minimum thread count for failure
+- This is the real fix — would make fused work for both prefill AND generation
+
+### ~~Priority 1 (old): Test hybrid dispatch fix~~ — DONE (v15)
+- Hybrid dispatch eliminates garbage but fused/autoregressive state incompatibility causes degradation
+- Not a viable production fix on its own
 
 ### Priority 3: Root-cause chunked path PPL degradation
 - Compare `build_delta_net_chunking` against upstream's chunked implementation
