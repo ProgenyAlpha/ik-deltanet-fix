@@ -137,30 +137,36 @@ Fused single-thread has 1.6x better generation but 6x worse prompt processing vs
 
 ## Agent Architecture Recommendation
 
-For the next debugging session, use a **two-agent approach**:
+For the next debugging session, use a **two-agent collaborative approach** — pair debugging, not assembly line:
 
-### Agent A: "Hypothesis Generator" (Opus/Sonnet)
-- Reads the codebase, generates specific hypotheses about what's causing the race
-- Formulates concrete, testable experiments (specific patches, specific test commands)
-- Does NOT execute — only plans
+### Agent A: "Analyst" (Opus)
+- Reads codebase, forms hypotheses, spots patterns in results
+- Proposes next investigative step (read specific code, try specific patch, check specific value)
 
-### Agent B: "Test Executor" (Bash-focused)
-- Takes Agent A's hypothesis and test plan
-- Builds Docker images, runs tests, collects results
-- Reports raw results back to Agent A
+### Agent B: "Operator" (Bash-capable)
+- Reads source, runs builds, executes tests, reports raw results
+- But also **pushes back** — "that hypothesis doesn't hold because I see X at line Y"
 
-### Workflow
+### Key: Conversational, not handoff-based
+
+The agents discuss at each stage rather than operating in strict plan→execute cycles. Agent B isn't a dumb executor — it reads code too and challenges Agent A's assumptions. Agent A doesn't wait for a full build-test cycle to pivot — if Agent B finds contradicting evidence while reading source, they course-correct immediately.
+
 ```
-Agent A: "Hypothesis: the CONT op for permute(0,2,1,3) miscalculates thread work ranges
-          when ne[1] != ne[2]. Test: patch CONT to single-thread for this case."
-   → Agent B builds, tests, reports: "Still broken"
-Agent A: "New hypothesis: the IK fusion of SUM_ROWS+DIV at line 23803 matches a node
-          adjacent to the CONT output. Test: disable IK fusion and retest."
-   → Agent B builds, tests, reports: "Fixed!"
-Agent A: "Root cause confirmed. Minimal fix: add guard to fusion pattern."
+A: "What if CONT miscalculates row stride for permute(0,2,1,3) when ne[1] != ne[2]?"
+B: "Reading ggml_compute_forward_dup_f32... no, the stride calc looks correct for that case.
+    But look — nb[2] here assumes contiguous src, and the permuted tensor isn't contiguous."
+A: "That's it. The nb values after permute are reordered but dup_f32 indexes with original
+    dimension order. Check if this specific permute pattern [0,2,1,3] hits a different code
+    branch than standard attention permutes."
+B: [reads code, confirms] "Yes — standard attention uses permute(0,2,1,3) too but the tensor
+    shapes are different. For delta_net, ne[1]=T=128 and ne[2]=H=32, so the work partitioning
+    across 12 threads splits differently."
 ```
 
-This prevents the single-agent loop problem where analysis and execution compete for context window space.
+This prevents:
+1. Single-agent context exhaustion (analysis + execution compete for window space)
+2. Rigid plan→test loops that waste build cycles on already-invalidated hypotheses
+3. One agent missing something the other would catch in real-time
 
 ## Key Source Locations
 
