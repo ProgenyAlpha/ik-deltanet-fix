@@ -166,6 +166,18 @@ sed -i 's|ggml_permute(ctx0, g, 2, 0, 3, 1)|ggml_permute(ctx0, g, 1, 0, 2, 3)|' 
 
 **Key insight:** Fused kernel produces correct PPL during prefill (T>1) but garbage during generation (T=1). Non-fused PP is actually faster (162 vs 110 t/s) but has degraded PPL from the chunked path bug. Non-fused TG matches upstream (7.25 vs 7.23).
 
+### Vulkan iGPU path (mainline llama.cpp, official Q4_K_M GGUF)
+
+| Config | PP tok/s | TG tok/s | Quality |
+|--------|----------|----------|---------|
+| 30/49 layers on GPU (2GB VRAM BIOS) | 37 | 10.5 | Coherent 500+ tokens, no degradation |
+| 49/49 layers on GPU (OOM at 2GB VRAM) | — | — | Needs BIOS VRAM bump |
+| Federico's (Vulkan, Q8_0, Debian native) | N/A | ~11 | Coherent with 16K context |
+
+**Critical finding:** Mainline Vulkan path produces fully coherent 500-token outputs with NO chunked DeltaNet degradation. The "(a (a (a..." repetition pattern only affects ik_llama.cpp's chunked DeltaNet path (both Codex and upstream transplant). Standard attention via mainline works correctly.
+
+**Docker + iGPU:** Docker passes `/dev/dri` through directly, no restriction. The bottleneck is BIOS VRAM allocation (currently 2GB). With 16GB VRAM BIOS setting, all 49 layers should fit on GPU via GTT.
+
 ## v16 Mainline Transplant Results
 
 ### Approach
