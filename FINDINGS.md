@@ -166,6 +166,42 @@ sed -i 's|ggml_permute(ctx0, g, 2, 0, 3, 1)|ggml_permute(ctx0, g, 1, 0, 2, 3)|' 
 
 **Key insight:** Fused kernel produces correct PPL during prefill (T>1) but garbage during generation (T=1). Non-fused PP is actually faster (162 vs 110 t/s) but has degraded PPL from the chunked path bug. Non-fused TG matches upstream (7.25 vs 7.23).
 
+## v16 Mainline Transplant Results
+
+### Approach
+Replaced Codex's `build_delta_net_chunking` and `build_delta_net_autoregressive` with upstream llama.cpp's implementations (`src/models/qwen3next.cpp`). Removed the fused kernel dispatch entirely.
+
+### Key adaptation for ik_llama.cpp
+- ik's `ggml_sub` uses `ggml_are_same_shape()` (strict, no broadcast)
+- ik's `ggml_mul` uses `ggml_can_repeat()` (supports broadcast)
+- Upstream code relies on `ggml_sub` broadcasting — had to add explicit `ggml_repeat_4d()` for:
+  - `gcs_i` (g_cumsum): `[chunk_size, 1, ...]` → `[chunk_size, chunk_size, ...]`
+  - `g_last` in g_diff: `[1, 1, ...]` → `[chunk_size, 1, ...]`
+
+### Test Results (v16, `-t 12`)
+
+| Prompt | Result |
+|--------|--------|
+| Capital of France | "The capital of France is Paris." — perfect |
+| CPU cache explanation | 241 tokens, fully coherent, no degradation |
+| Internet history (long) | Coherent ~200 tokens, then "(a (a (a..." repetition |
+| Python function | Coherent ~200 tokens, then "1, 1, 1, ..." repetition |
+
+### Comparison: v16 Upstream vs v7 Codex (same `--no-fused-delta` test)
+
+**Same degradation pattern on both.** v7 Codex chunking also produces "a flame, a flame..." repetition on the internet history prompt. Confirms the issue is inherent to the chunked DeltaNet path (Bug #3), NOT specific to our transplant.
+
+### Performance
+
+| Config | PP tok/s | TG tok/s |
+|--------|----------|----------|
+| v16 mainline, `-t 12` | 58-94 | 9.0-9.7 |
+| v7 Codex, `--no-fused-delta -t 12` | 84 | 9.6 |
+| Same hardware, Vulkan Q8_0 (llama.cpp #19396) | N/A | ~11 |
+
+### Cross-request state contamination
+Server reuses KV cache slot between requests. DeltaNet recurrence state leaks between conversations. After "CPU cache" prompt, next "7×8" prompt hallucinated about cache layers. **Workaround: restart between requests.** This is a server-side issue, not our fix.
+
 ## Docker Images on NAS
 
 | Image | Description | Status |
@@ -175,6 +211,7 @@ sed -i 's|ggml_permute(ctx0, g, 2, 0, 3, 1)|ggml_permute(ctx0, g, 1, 0, 2, 3)|' 
 | `ik-pr1251-v13-ntasks1` | n_tasks=1 attempt | Failed (nth still 12 in kernel) |
 | `ik-pr1251-v14` | Single-thread kernel patch | Proved race is outside kernel |
 | `ik-pr1251-v15-hybrid` | Hybrid dispatch (fused PP + auto TG) | Partial fix — no garbage but degrades after ~100 tokens |
+| `ik-pr1251-v16-mainline` | Upstream transplant (chunked + auto) | **Working** — same quality as Codex non-fused |
 
 ## Next Steps
 
@@ -184,21 +221,24 @@ sed -i 's|ggml_permute(ctx0, g, 2, 0, 3, 1)|ggml_permute(ctx0, g, 1, 0, 2, 3)|' 
 - Test with `-t 2` to find minimum thread count for failure
 - This is the real fix — would make fused work for both prefill AND generation
 
-### ~~Priority 1 (old): Test hybrid dispatch fix~~ — DONE (v15)
-- Hybrid dispatch eliminates garbage but fused/autoregressive state incompatibility causes degradation
-- Not a viable production fix on its own
+### Priority 2: Chunked path quality degradation (Bug #3)
+- Both Codex and upstream chunking degrade after ~200 tokens on long-form prose
+- The fused kernel (PPL 3.01) vs chunked (PPL 4.17) gap suggests numerical differences
+- May need fused for both PP and TG — which requires fixing the T=1 threading bug
 
-### Priority 3: Root-cause chunked path PPL degradation
-- Compare `build_delta_net_chunking` against upstream's chunked implementation
-- Codex may have "invented" a different chunking algorithm (same pattern as the fused kernel)
-
-### Priority 4: Address Codex regressions
+### Priority 3: Address Codex regressions
 - ikawrakow noted Codex reverted his MoE row counting optimization (the major MoE bottleneck fix)
 - CUDA PP is 3.3x slower than upstream because of these regressions
 - Codex also disabled FA by default for CPU — need to remove that override
 
-### PR Comment — DONE
+### ~~Priority 1 (old): Test hybrid dispatch fix~~ — DONE (v15)
+- Hybrid dispatch eliminates garbage but fused/autoregressive state incompatibility causes degradation
+- Not a viable production fix on its own
+
+### PR Comments
 - Posted findings: https://github.com/ikawrakow/ik_llama.cpp/pull/1251#issuecomment-3879689776
+- v15 hybrid results: https://github.com/ikawrakow/ik_llama.cpp/pull/1251#issuecomment-3880057796
+- 3-bug summary: https://github.com/ikawrakow/ik_llama.cpp/pull/1251#issuecomment-3880064369
 - ikawrakow independently confirmed CPU broken, suggested copying mainline implementation
 
 ## Agent Architecture Recommendation
