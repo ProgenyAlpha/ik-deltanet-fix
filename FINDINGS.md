@@ -8,7 +8,13 @@
 
 ## Executive Summary
 
-The fused DeltaNet CPU kernel (`ggml_compute_forward_delta_net_f32` in `ggml/src/ggml.c:21939`) produces **garbage output with multi-threading** but works perfectly with a single thread. The race condition is **NOT inside the kernel itself** — it's in the surrounding GGML graph ops, likely the `ggml_cont_4d(ggml_permute(...))` data layout transformation ops that prepare tensors for the kernel.
+Three separate CPU bugs identified in PR #1251's Codex-generated DeltaNet implementation:
+
+1. **Fused generation broken** — The fused kernel produces garbage during multi-threaded generation (T=1). Race condition in `ggml_cont_4d(ggml_permute(...))` ops, NOT the kernel itself. Works with `-t 1`.
+2. **Non-FA path broken** — Codex marked CPU FA as "unstable" and disabled it by default. The non-FA code path produces bad PPL. Fix: remove the override, re-enable FA.
+3. **Chunked path PPL degraded** — `build_delta_net_chunking` produces significantly worse perplexity than the fused kernel (4.17 vs 3.01 at batch 1). Separate implementation bug.
+
+**Root cause of fused generation bug:** The dispatch at line ~4980 sends ALL tokens through `build_delta_net_fused` when fused mode is on, including T=1 generation tokens. The fused path runs 5 `ggml_cont_4d(ggml_permute(...))` ops that have a multi-threading race condition for small tensor shapes (T=1). The non-fused autoregressive path (`build_delta_net_autoregressive`) handles T=1 correctly with standard GGML ops but is never called when fused is enabled.
 
 ## Proven Facts
 
@@ -63,7 +69,7 @@ Input → chunk processing via GGML ops → output
 ```
 Also no custom kernel.
 
-## Key Hypothesis: `ggml_cont_4d(ggml_permute(...))` Threading Bug
+## Key Hypothesis: `ggml_cont_4d(ggml_permute(...))` Threading Bug (T=1 specific)
 
 The ONLY difference between the working non-fused path and the broken fused path:
 - Fused: 5x `ggml_cont_4d(ggml_permute(...))` ops + 1x ggml_delta_net kernel + 1x output cont
@@ -71,7 +77,39 @@ The ONLY difference between the working non-fused path and the broken fused path
 
 The `GGML_OP_CONT` op handles copying from non-contiguous (permuted) source to contiguous destination. With 12 threads, each thread copies a portion. If this multi-threaded copy has a bug for specific permutation patterns, it would corrupt the kernel's inputs.
 
-**Why this wasn't caught before:** The specific permute patterns used here ([S,H,T,B]→[S,T,H,B]) may be unusual. Standard transformer attention uses different permute patterns that exercise different code paths in `ggml_compute_forward_dup_f32`.
+**Refined by ikawrakow's PPL data:** The fused path produces **correct PPL during prefill** (T>1) but **garbage during generation** (T=1). This means the CONT threading bug is **shape-dependent** — it triggers when T=1 (small inner dimension after permute) but not when T is large. With T=1, the work partitioning across 12 threads may create degenerate ranges or off-by-one errors in `ggml_compute_forward_dup_f32`.
+
+**Why this wasn't caught before:** Standard transformer attention uses permute(0,2,1,3) too, but with T=1 the tensor is already effectively contiguous in the permuted dimensions, so the CONT op is a no-op or trivial copy. The delta-net permute pattern applied to 4D tensors with T=1 may exercise a rarely-tested code path.
+
+## Proposed Fix: Hybrid Dispatch
+
+The dispatch at `src/llama-build-context.cpp:~4980` currently sends ALL tokens through fused when enabled:
+
+```cpp
+// CURRENT (broken for T=1 generation)
+if (use_fused_delta_net) {
+    attn_out = build_delta_net_fused(q, k, v, gate, beta, state, il);
+} else {
+    attn_out = n_tok == 1
+        ? build_delta_net_autoregressive(...)
+        : build_delta_net_chunking(...);
+}
+```
+
+Proposed fix — fused for prefill only, autoregressive for generation:
+
+```cpp
+// FIXED: fused for T>1 (correct PPL), autoregressive for T=1 (correct output)
+if (use_fused_delta_net && n_tok > 1) {
+    attn_out = build_delta_net_fused(q, k, v, gate, beta, state, il);
+} else if (n_tok == 1) {
+    attn_out = build_delta_net_autoregressive(q, k, v, gate, beta, state, il);
+} else {
+    attn_out = build_delta_net_chunking(q, k, v, gate, beta, state, causal_mask, identity, diag_mask, il);
+}
+```
+
+This sidesteps the CONT threading bug for generation and the chunked PPL degradation for prefill. Expected performance: ~110+ t/s PP (fused) + ~7-11 t/s TG (autoregressive) with correct output.
 
 ## Required Patches (Working Non-Fused Build)
 
@@ -97,13 +135,24 @@ sed -i 's|ggml_permute(ctx0, g, 2, 0, 3, 1)|ggml_permute(ctx0, g, 1, 0, 2, 3)|' 
 
 ## Performance Baseline
 
+### Our hardware (AMD Ryzen AI 9 HX PRO 370, 12c/24t, CPU-only, Q4_K)
+
 | Config | Prompt tok/s | Gen tok/s |
 |--------|-------------|-----------|
 | Ollama (baseline) | — | 7.74 |
 | `--no-fused-delta -t 12` | ~63 | ~9.5 |
 | `-t 1` fused | ~10 | ~15.6 |
 
-Fused single-thread has 1.6x better generation but 6x worse prompt processing vs non-fused multi-threaded.
+### ikawrakow's hardware (Ryzen 3995WX, CPU-only, IQ4_XS)
+
+| Config | PP-2048 tok/s | TG-128 tok/s | PPL [1] |
+|--------|--------------|-------------|---------|
+| Upstream llama.cpp | 70.4 | 7.23 | 2.99 |
+| PR #1251, fused on, FA on | 110.6 | 11.63 | 3.01 (correct) |
+| PR #1251, fused off, FA on | 162 | 7.25 | 4.17 (degraded) |
+| PR #1251, fused on, FA off | — | — | 17.5 (broken) |
+
+**Key insight:** Fused kernel produces correct PPL during prefill (T>1) but garbage during generation (T=1). Non-fused PP is actually faster (162 vs 110 t/s) but has degraded PPL from the chunked path bug. Non-fused TG matches upstream (7.25 vs 7.23).
 
 ## Docker Images on NAS
 
@@ -116,24 +165,28 @@ Fused single-thread has 1.6x better generation but 6x worse prompt processing vs
 
 ## Next Steps
 
-### Priority 1: Isolate the CONT/permute bug
-- Test v14 with `-t 2` — does even 2 threads trigger the bug?
-- Add checksum verification: compute hash of delta_net input tensors (after cont+permute) and compare single-thread vs multi-thread
-- Read `ggml_compute_forward_dup_f32` for the f32-from-non-contiguous code path
+### Priority 1: Test hybrid dispatch fix
+- Patch the dispatch to use fused for T>1, autoregressive for T=1
+- Verify correct output AND correct PPL with multi-threading
+- This is likely a one-session task
 
-### Priority 2: Build a diagnostic version
-- Patch the fused path to use `n_tasks=1` for the CONT ops (not the delta_net kernel)
-- Or: patch `ggml_compute_forward_dup_f32` to be single-threaded for specific tensor shapes
+### Priority 2: Root-cause the CONT threading bug (T=1)
+- Read `ggml_compute_forward_dup_f32` — find the f32-from-permuted code path
+- Determine why T=1 tensor shapes trigger the race but T>1 doesn't
+- Test with `-t 2` to find minimum thread count for failure
 
-### Priority 3: Fix or workaround
-- If CONT bug confirmed: fix the multi-threading in `ggml_compute_forward_dup_f32` for permuted sources
-- Alternative workaround: modify kernel to accept [S,H,T,B] layout directly (skip the cont+permute entirely)
-- Simplest workaround: use `--no-fused-delta` flag (already works)
+### Priority 3: Root-cause chunked path PPL degradation
+- Compare `build_delta_net_chunking` against upstream's chunked implementation
+- Codex may have "invented" a different chunking algorithm (same pattern as the fused kernel)
 
-### PR Comment
-- Nexesenex commented about `--fused-delta` / `--no-fused-delta` params being redundant
-- Our findings are HIGHLY relevant: the fused path has a multi-threading bug
-- Should comment on PR with findings once root cause is confirmed
+### Priority 4: Address Codex regressions
+- ikawrakow noted Codex reverted his MoE row counting optimization (the major MoE bottleneck fix)
+- CUDA PP is 3.3x slower than upstream because of these regressions
+- Codex also disabled FA by default for CPU — need to remove that override
+
+### PR Comment — DONE
+- Posted findings: https://github.com/ikawrakow/ik_llama.cpp/pull/1251#issuecomment-3879689776
+- ikawrakow independently confirmed CPU broken, suggested copying mainline implementation
 
 ## Agent Architecture Recommendation
 
